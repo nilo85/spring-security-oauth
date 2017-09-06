@@ -15,15 +15,14 @@ package org.springframework.security.oauth2.provider.token.store;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.springframework.beans.factory.InitializingBean;
-import org.springframework.security.crypto.codec.Base64;
 import org.springframework.security.jwt.Jwt;
 import org.springframework.security.jwt.JwtHelper;
-import org.springframework.security.jwt.crypto.sign.*;
+import org.springframework.security.jwt.crypto.sign.SignatureVerifier;
+import org.springframework.security.jwt.crypto.sign.Signer;
 import org.springframework.security.oauth2.common.*;
 import org.springframework.security.oauth2.common.exceptions.InvalidTokenException;
 import org.springframework.security.oauth2.common.util.JsonParser;
 import org.springframework.security.oauth2.common.util.JsonParserFactory;
-import org.springframework.security.oauth2.common.util.RandomValueStringGenerator;
 import org.springframework.security.oauth2.provider.OAuth2Authentication;
 import org.springframework.security.oauth2.provider.token.AccessTokenConverter;
 import org.springframework.security.oauth2.provider.token.DefaultAccessTokenConverter;
@@ -31,9 +30,6 @@ import org.springframework.security.oauth2.provider.token.TokenEnhancer;
 import org.springframework.util.Assert;
 
 import java.security.KeyPair;
-import java.security.PrivateKey;
-import java.security.interfaces.RSAPrivateKey;
-import java.security.interfaces.RSAPublicKey;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -69,13 +65,7 @@ public class JwtAccessTokenConverter implements TokenEnhancer, AccessTokenConver
 
 	private JsonParser objectMapper = JsonParserFactory.create();
 
-	private String verifierKey = new RandomValueStringGenerator().generate();
-
-	private Signer signer = new MacSigner(verifierKey);
-
-	private String signingKey = verifierKey;
-
-	private SignatureVerifier verifier;
+	private JwtKeyManager keyManager = new DefaultJwtKeyManager();
 
 	/**
 	 * @param tokenConverter the tokenConverter to set
@@ -121,13 +111,21 @@ public class JwtAccessTokenConverter implements TokenEnhancer, AccessTokenConver
 		return tokenConverter.extractAuthentication(map);
 	}
 
+	private DefaultJwtKeyManager getDefaultKeyManager() {
+		if (keyManager instanceof DefaultJwtKeyManager) {
+			return (DefaultJwtKeyManager) keyManager;
+		}
+		throw new RuntimeException("Unsupported operation with non-default JwtKeyManager");
+	}
+
 	/**
 	 * Unconditionally set the verifier (the verifer key is then ignored).
 	 *
 	 * @param verifier the value to use
 	 */
+	@Deprecated
 	public void setVerifier(SignatureVerifier verifier) {
-		this.verifier = verifier;
+		getDefaultKeyManager().setVerifier(verifier);
 	}
 
 	/**
@@ -135,8 +133,9 @@ public class JwtAccessTokenConverter implements TokenEnhancer, AccessTokenConver
 	 *
 	 * @param signer the value to use
 	 */
+	@Deprecated
 	public void setSigner(Signer signer) {
-		this.signer = signer;
+		getDefaultKeyManager().setSigner(signer);
 	}
 
 	/**
@@ -145,20 +144,12 @@ public class JwtAccessTokenConverter implements TokenEnhancer, AccessTokenConver
 	 * @return the key used to verify tokens
 	 */
 	public Map<String, String> getKey() {
-		Map<String, String> result = new LinkedHashMap<String, String>();
-		result.put("alg", signer.algorithm());
-		result.put("value", verifierKey);
-		return result;
+		return keyManager.getKey();
 	}
 
+	@Deprecated
 	public void setKeyPair(KeyPair keyPair) {
-		PrivateKey privateKey = keyPair.getPrivate();
-		Assert.state(privateKey instanceof RSAPrivateKey, "KeyPair must be an RSA ");
-		signer = new RsaSigner((RSAPrivateKey) privateKey);
-		RSAPublicKey publicKey = (RSAPublicKey) keyPair.getPublic();
-		verifier = new RsaVerifier(publicKey);
-		verifierKey = "-----BEGIN PUBLIC KEY-----\n" + new String(Base64.encode(publicKey.getEncoded()))
-				+ "\n-----END PUBLIC KEY-----";
+		getDefaultKeyManager().setKeyPair(keyPair);
 	}
 
 	/**
@@ -167,35 +158,17 @@ public class JwtAccessTokenConverter implements TokenEnhancer, AccessTokenConver
 	 *
 	 * @param key the key to be used for signing JWTs.
 	 */
+	@Deprecated
 	public void setSigningKey(String key) {
-		Assert.hasText(key);
-		key = key.trim();
-
-		this.signingKey = key;
-
-		if (isPublic(key)) {
-			signer = new RsaSigner(key);
-			logger.info("Configured with RSA signing key");
-		}
-		else {
-			// Assume it's a MAC key
-			this.verifierKey = key;
-			signer = new MacSigner(key);
-		}
+		getDefaultKeyManager().setSigningKey(key);
 	}
 
-	/**
-	 * @return true if the key has a public verifier
-	 */
-	private boolean isPublic(String key) {
-		return key.startsWith("-----BEGIN");
-	}
 
 	/**
 	 * @return true if the signing key is a public key
 	 */
 	public boolean isPublic() {
-		return signer instanceof RsaSigner;
+		return keyManager.isPublic();
 	}
 
 	/**
@@ -208,8 +181,9 @@ public class JwtAccessTokenConverter implements TokenEnhancer, AccessTokenConver
 	 *
 	 * @param key the signature verification key (typically an RSA public key)
 	 */
+	@Deprecated
 	public void setVerifierKey(String key) {
-		this.verifierKey = key;
+		getDefaultKeyManager().setVerifierKey(key);
 	}
 
 	public OAuth2AccessToken enhance(OAuth2AccessToken accessToken, OAuth2Authentication authentication) {
@@ -268,13 +242,13 @@ public class JwtAccessTokenConverter implements TokenEnhancer, AccessTokenConver
 		catch (Exception e) {
 			throw new IllegalStateException("Cannot convert access token to JSON", e);
 		}
-		String token = JwtHelper.encode(content, signer).getEncoded();
+		String token = JwtHelper.encode(content, keyManager.getSigner()).getEncoded();
 		return token;
 	}
 
 	protected Map<String, Object> decode(String token) {
 		try {
-			Jwt jwt = JwtHelper.decodeAndVerify(token, verifier);
+			Jwt jwt = JwtHelper.decodeAndVerify(token, keyManager.getVerifier());
 			String claimsStr = jwt.getClaims();
 			Map<String, Object> claims = objectMapper.parseMap(claimsStr);
 			if (claims.containsKey(EXP) && claims.get(EXP) instanceof Integer) {
@@ -290,35 +264,9 @@ public class JwtAccessTokenConverter implements TokenEnhancer, AccessTokenConver
 	}
 
 	public void afterPropertiesSet() throws Exception {
-		if (verifier != null) {
-			// Assume signer also set independently if needed
-			return;
+		if (keyManager instanceof DefaultJwtKeyManager) {
+			getDefaultKeyManager().afterPropertiesSet();
 		}
-		SignatureVerifier verifier = new MacSigner(verifierKey);
-		try {
-			verifier = new RsaVerifier(verifierKey);
-		}
-		catch (Exception e) {
-			logger.warn("Unable to create an RSA verifier from verifierKey (ignoreable if using MAC)");
-		}
-		// Check the signing and verification keys match
-		if (signer instanceof RsaSigner) {
-			byte[] test = "test".getBytes();
-			try {
-				verifier.verify(test, signer.sign(test));
-				logger.info("Signing and verification RSA keys match");
-			}
-			catch (InvalidSignatureException e) {
-				logger.error("Signing and verification RSA keys do not match");
-			}
-		}
-		else if (verifier instanceof MacSigner) {
-			// Avoid a race condition where setters are called in the wrong order. Use of
-			// == is intentional.
-			Assert.state(this.signingKey == this.verifierKey,
-					"For MAC signing you do not need to specify the verifier key separately, and if you do it must match the signing key");
-		}
-		this.verifier = verifier;
 	}
 
 	private class NoOpJwtClaimsSetVerifier implements JwtClaimsSetVerifier {
